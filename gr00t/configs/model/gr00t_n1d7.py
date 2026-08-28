@@ -122,6 +122,17 @@ class Gr00tN1d7Config(PretrainedConfig):
     # Multi-embodiment parameters
     max_num_embodiments: int = 32
 
+    # Training-only world token supervision (adapted from GaussianDream++).
+    # When enabled, dedicated World State / World Prediction tokens join the
+    # action head's token sequence and a lightweight World Representation Head
+    # adds auxiliary world-modeling losses during training. The head is dropped
+    # at inference; only the world tokens remain in the sequence.
+    use_world_tokens: bool = False
+    num_world_state_tokens: int = 8
+    num_world_prediction_tokens: int = 12
+    world_state_loss_weight: float = 1.0
+    world_motion_loss_weight: float = 1.0
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         for key, value in kwargs.items():

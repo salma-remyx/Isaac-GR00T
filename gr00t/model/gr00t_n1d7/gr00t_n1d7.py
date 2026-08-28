@@ -30,6 +30,7 @@ from gr00t.model.modules.embodiment_conditioned_mlp import (
     CategorySpecificMLP,
     MultiEmbodimentActionEncoder,
 )
+from gr00t.model.modules.world_tokens import WorldTokenHead
 
 
 logger = logging.getLogger(__name__)
@@ -98,6 +99,24 @@ class Gr00tN1d7ActionHead(nn.Module):
         # State dropout parameters
         self.state_dropout_prob = config.state_dropout_prob
 
+        # Training-only world token supervision (adapted from GaussianDream++):
+        # World State / World Prediction tokens join the DiT sequence, and a
+        # lightweight World Representation Head adds auxiliary losses during
+        # training. Only the tokens remain at inference.
+        self.world_head = (
+            WorldTokenHead(
+                num_state_tokens=config.num_world_state_tokens,
+                num_prediction_tokens=config.num_world_prediction_tokens,
+                token_dim=self.input_embedding_dim,
+                decode_dim=self.hidden_size,
+                state_dim=config.max_state_dim,
+                action_horizon=config.action_horizon,
+                action_dim=self.action_dim,
+            )
+            if config.use_world_tokens
+            else None
+        )
+
         # Pin the time-sampling Beta to CPU/fp32 explicitly. The action head can
         # be instantiated under a meta / no_init_weights default-device context
         # (e.g. nested from_pretrained). A Beta built from bare Python floats
@@ -132,6 +151,8 @@ class Gr00tN1d7ActionHead(nn.Module):
             self.action_decoder.requires_grad_(False)
             if self.config.add_pos_embed:
                 self.position_embedding.requires_grad_(False)
+            if self.world_head is not None:
+                self.world_head.requires_grad_(False)
         if not tune_diffusion_model:
             self.model.requires_grad_(False)
         if not tune_vlln:
@@ -246,6 +267,8 @@ class Gr00tN1d7ActionHead(nn.Module):
 
         # Join vision, language, state and action embedding along sequence dimension.
         sa_embs = torch.cat((state_features, action_features), dim=1)
+        if self.world_head is not None:
+            sa_embs = self.world_head.append_to_sequence(sa_embs)
         vl_attn_mask = backbone_output.backbone_attention_mask
 
         if self.config.use_alternate_vl_dit:
@@ -277,12 +300,31 @@ class Gr00tN1d7ActionHead(nn.Module):
         action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
         loss = action_loss.sum() / (action_mask.sum() + 1e-6)
 
+        # World token auxiliary supervision (training only). The last state
+        # history step supervises persistent structure; the clean future action
+        # chunk (relative-EEF residuals) supervises short-horizon dynamics.
+        world_losses = {}
+        if self.world_head is not None:
+            state_target = action_input.state[:, 0, -self.config.max_state_dim :]
+            world_losses = self.world_head.compute_losses(
+                model_output[:, : self.world_head.num_tokens],
+                state_target,
+                actions,
+                action_mask,
+            )
+            loss = (
+                loss
+                + self.config.world_state_loss_weight * world_losses["world_state_loss"]
+                + self.config.world_motion_loss_weight * world_losses["world_motion_loss"]
+            )
+
         return {
             "loss": loss,
             "action_loss": action_loss,
             "action_mask": action_mask,
             "backbone_features": vl_embeds,
             "state_features": state_features,
+            **world_losses,
         }
 
     def _encode_features(
@@ -411,6 +453,10 @@ class Gr00tN1d7ActionHead(nn.Module):
 
             # Join vision, language, state and action embedding along sequence dimension.
             sa_embs = torch.cat((state_features, action_features), dim=1)
+            # Keep the world tokens in the sequence at inference (the decode
+            # head and auxiliary losses are training-only).
+            if self.world_head is not None:
+                sa_embs = self.world_head.append_to_sequence(sa_embs)
 
             # Run model forward.
             if self.config.use_alternate_vl_dit:
