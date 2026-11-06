@@ -633,3 +633,25 @@ We welcome issues and pull requests. See [CONTRIBUTING.md](CONTRIBUTING.md) for 
   booktitle  = {ArXiv Preprint},
 }
 ```
+
+
+## Inference-Efficiency: Visual Token Pruning (Optional)
+
+Camera images expand into hundreds-to-thousands of visual tokens that the action head's cross-attention processes at every control step. GR00T N1.7 ships an opt-in, training-free visual token pruner for the action head — adapted from [FastVLA](https://arxiv.org/abs/2610.22146) — which drops task-irrelevant visual tokens before the action head runs:
+
+- **Task-conditioned scoring**: every visual token is scored by the attention it receives from the task (instruction) tokens, computed parameter-free over the backbone features, so importance tracks the current goal instead of generic visual saliency.
+- **Temporally adaptive budget**: the fraction of visual tokens kept at each step is set from the importance distribution's uniformity (inverse-Simpson index) and calibrated against a sliding window of recent steps — peaked distributions are pruned aggressively, flat ones conservatively, so control-critical tokens are not discarded when the scene demands them.
+
+Enable it by adding the following key to your checkpoint's `config.json` (it is off by default and only runs in eval mode, matching FastVLA's training-free design):
+
+```json
+"visual_token_pruner_cfg": {
+    "min_keep_ratio": 0.25,
+    "max_keep_ratio": 0.75,
+    "min_visual_tokens": 16,
+    "window_size": 8,
+    "apply_during_training": false
+}
+```
+
+The pruned stream is fully mask-consistent with the action head's image/text attention paths, and its latency payoff can be measured end-to-end with the deployment benchmark: `python scripts/deployment/benchmark_inference.py`.

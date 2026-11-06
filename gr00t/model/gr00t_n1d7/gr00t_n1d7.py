@@ -30,6 +30,7 @@ from gr00t.model.modules.embodiment_conditioned_mlp import (
     CategorySpecificMLP,
     MultiEmbodimentActionEncoder,
 )
+from gr00t.model.modules.visual_token_pruner import AdaptiveVisualTokenPruner
 
 
 logger = logging.getLogger(__name__)
@@ -90,6 +91,16 @@ class Gr00tN1d7ActionHead(nn.Module):
             self.vl_self_attention = SelfAttentionTransformer(**vl_self_attention_cfg)
         else:
             self.vl_self_attention = nn.Identity()
+
+        # Opt-in, training-free visual token pruning (FastVLA-style) of the
+        # backbone's visual stream ahead of the action head. Wired through the
+        # same config-kwargs pattern as vl_self_attention_cfg above.
+        visual_token_pruner_cfg = getattr(config, "visual_token_pruner_cfg", None)
+        if visual_token_pruner_cfg:
+            self.visual_token_pruner = AdaptiveVisualTokenPruner(**visual_token_pruner_cfg)
+            logger.info(f"Visual token pruning enabled: {self.visual_token_pruner}")
+        else:
+            self.visual_token_pruner = None
 
         if config.add_pos_embed:
             self.position_embedding = nn.Embedding(config.max_seq_len, self.input_embedding_dim)
@@ -173,6 +184,15 @@ class Gr00tN1d7ActionHead(nn.Module):
         return sample
 
     def process_backbone_output(self, backbone_output: BatchFeature) -> BatchFeature:
+        # Prune task-irrelevant visual tokens (eval mode only, matching the
+        # training-free FastVLA design) before any consumer of the visual
+        # stream; the pruner compacts and rewrites the batch's features/masks
+        # in place, so vl_self_attention and the DiT below run on a shorter,
+        # mask-consistent sequence.
+        if self.visual_token_pruner is not None and (
+            not self.training or self.visual_token_pruner.apply_during_training
+        ):
+            backbone_output = self.visual_token_pruner(backbone_output)
         backbone_features = backbone_output["backbone_features"]
         backbone_features = self.vlln(backbone_features)
         backbone_features = self.vl_self_attention(backbone_features)
