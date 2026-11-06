@@ -482,12 +482,20 @@ class Gr00tPolicy(BasePolicy):
     def reset(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
         """Reset the policy to its initial state.
 
+        Called at every episode boundary (the inference server exposes it as
+        the ``reset`` endpoint), which is where the opt-in visual token pruner
+        must clear its sliding calibration window: FastVLA's warm-up and
+        calibration are per-episode, so state must not bleed across episodes.
+
         Args:
             options: Dictionary containing the options for the reset
 
         Returns:
             Dictionary containing the info after resetting the policy
         """
+        pruner = getattr(getattr(self.model, "action_head", None), "visual_token_pruner", None)
+        if pruner is not None:
+            pruner.reset()
         return {}
 
 

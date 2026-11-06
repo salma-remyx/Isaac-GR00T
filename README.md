@@ -633,3 +633,27 @@ We welcome issues and pull requests. See [CONTRIBUTING.md](CONTRIBUTING.md) for 
   booktitle  = {ArXiv Preprint},
 }
 ```
+
+
+## Inference-Efficiency: Visual Token Pruning (Optional)
+
+Camera images expand into hundreds-to-thousands of visual tokens that the action head's cross-attention processes at every control step. GR00T N1.7 ships an opt-in, training-free visual token pruner for the action head — adapted from [FastVLA](https://arxiv.org/abs/2610.22146) — which drops task-irrelevant visual tokens before the action head runs:
+
+- **Task-conditioned scoring**: every visual token is scored by the attention it receives from the task (instruction) tokens — a parameter-free attention head over RMSNorm-normalized backbone features, exactly as in FastVLA — so importance tracks the current goal instead of generic visual saliency.
+- **Temporally adaptive budget**: the fraction of visual tokens kept at each step is set from the uniformity of the importance distribution over the eventual keep-set (normalized inverse-Simpson index of the top-K scores) and calibrated against a sliding window of recent steps — peaked distributions are pruned aggressively, flat ones conservatively, so control-critical tokens are not discarded when the scene demands them. The first two steps of every episode keep the maximum budget while the window populates.
+
+Enable it by adding the following key to your checkpoint's `config.json` (it is off by default and only runs in eval mode, matching FastVLA's training-free design). The defaults match FastVLA's deploy defaults (`rho = 0.8`, `tau = 0.1`, `window = 10`, i.e. a keep band of `[0.1, 0.3]`):
+
+```json
+"visual_token_pruner_cfg": {
+    "min_keep_ratio": 0.1,
+    "max_keep_ratio": 0.3,
+    "min_visual_tokens": 1,
+    "window_size": 10,
+    "apply_during_training": false
+}
+```
+
+Calibration state is per-episode: call the policy's `reset()` (the inference server's `reset` endpoint) at the start of every episode, which clears the sliding window and restarts the warm-up, as every FastVLA integration does at `env.reset()`.
+
+The pruned stream is fully mask-consistent with the action head's image/text attention paths, and its latency payoff can be measured end-to-end with the deployment benchmark: `python scripts/deployment/benchmark_inference.py`.
