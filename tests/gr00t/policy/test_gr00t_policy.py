@@ -170,6 +170,28 @@ class TestGr00tPolicyGetAction:
         assert isinstance(info, dict)
 
 
+class TestGr00tPolicyReset:
+    def test_reset_clears_visual_token_pruner_calibration(self, policy):
+        # Every FastVLA integration clears the pruner's sliding calibration
+        # window at the episode boundary; the served reset endpoint dispatches
+        # to Gr00tPolicy.reset, so the reset must reach the pruner.
+        from gr00t.model.modules.visual_token_pruner import AdaptiveVisualTokenPruner
+
+        pruner = AdaptiveVisualTokenPruner()
+        pruner._window.extend([0.3, 0.7])
+        pruner._step = 5
+        policy.model.action_head.visual_token_pruner = pruner
+
+        assert policy.reset() == {}
+
+        assert len(pruner._window) == 0
+        assert pruner._step == 0  # warm-up restarts deterministically
+
+    def test_reset_without_pruner_is_noop(self, policy):
+        policy.model.action_head.visual_token_pruner = None
+        assert policy.reset() == {}
+
+
 class _NumpyLanguageSimPolicy:
     def __init__(self):
         self.modality_configs = {

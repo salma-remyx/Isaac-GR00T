@@ -23,22 +23,27 @@ for Efficient Vision-Language-Action Models", arXiv:2610.22146), adapted to the
 GR00T N1.7 backbone feature stream:
 
 1. **Task-conditioned importance.** FastVLA scores each visual token by the
-   attention it receives from the task tokens, read from the LLM's attention
-   maps. The frozen Qwen3-VL backbone does not expose those maps at the action
-   head call site, so the same task-to-vision attention is computed here as a
-   parameter-free single head over the backbone features: a scaled dot product
-   with a shared (identity) query/key projection, softmaxed over visual tokens
-   and summed over task tokens. Tokens describing the current goal thereby
-   vote for the visual tokens they relate to — no learned estimator, no
-   training, and importance tracks the task instead of generic saliency.
+   attention it receives from the task tokens via a parameter-free single
+   attention head over the token embeddings themselves (not the LLM's internal
+   attention maps): a scaled dot product between RMSNorm-normalized task and
+   visual features, softmaxed over visual tokens and averaged over task tokens
+   (zero-vector task rows are skipped). Tokens describing the current goal
+   thereby vote for the visual tokens they relate to — no learned estimator,
+   no training, and importance tracks the task instead of generic saliency.
+   The same quantity is computed here over the backbone feature stream; the
+   feature/mask layout replaces the reference's fixed ``[BOS | visual | task]``
+   sequence split.
 2. **Temporally adaptive budget.** The keep ratio is set per step from the
-   uniformity of the importance distribution via the normalized inverse-Simpson
-   index (``1 / sum(p^2) / N``): a peaked distribution means a few tokens carry
-   the task and the tail can be dropped aggressively, while a near-uniform
+   uniformity of the importance distribution over the eventual keep-set: the
+   normalized inverse-Simpson effective token count ``(1 / sum(q^2)) / K`` of
+   the top-K scores, where ``K = ceil(N * min_keep_ratio - 1e-9)`` is the
+   smallest budget the keep band can request. Importance concentrated on a few
+   tokens means the tail can be dropped aggressively, while a near-uniform
    distribution means control-relevant evidence is spread across the visual
    field and pruning must stay conservative. The current uniformity is
-   calibrated against a sliding window of recent steps, so budgets follow scene
-   dynamics rather than a static threshold.
+   min-max calibrated (clipped to [0, 1]) against a sliding window of the
+   previous steps, and the first two steps of every episode run at the
+   maximum-keep end of the band while the window populates.
 
 Pruning compacts the kept tokens to the front of the sequence and rewrites
 ``backbone_features`` / ``backbone_attention_mask`` / ``image_mask`` in place.
@@ -47,9 +52,18 @@ Every downstream consumer of the visual stream (``vl_self_attention``, the DiT's
 sequence-length agnostic, so the pruned batch flows through unchanged code
 paths at a shorter sequence length.
 
+The rate band is expressed in keep-ratio form: ``keep = min_keep_ratio +
+alpha * (max_keep_ratio - min_keep_ratio)``, the exact reparameterization of
+the reference's ``rate = rho + tau - 2 * tau * alpha`` with
+``min_keep_ratio = 1 - (rho + tau)`` and ``max_keep_ratio = 1 - (rho - tau)``.
+Defaults match the reference deploy defaults (``rho = 0.8``, ``tau = 0.1``,
+``window = 10``).
+
 The pruner is opt-in via the ``visual_token_pruner_cfg`` config key (see
 ``Gr00tN1d7ActionHead``). It only runs in eval mode by default, matching
-FastVLA's training-free, inference-time design.
+FastVLA's training-free, inference-time design, and its calibration state must
+be cleared at every episode boundary via ``Gr00tPolicy.reset()`` (the served
+``reset`` endpoint), as every FastVLA integration does at ``env.reset``.
 """
 
 from collections import deque
@@ -68,10 +82,18 @@ logger = logging.getLogger(__name__)
 class PruningStats:
     """Per-step record of the adaptive pruning decision (for logging and tests)."""
 
-    uniformity: float  # normalized inverse-Simpson index of visual importance, in (0, 1]
+    uniformity: float  # normalized inverse-Simpson index of the top-K keep-set scores, in (0, 1]
     keep_ratio: float  # calibrated visual keep ratio for this step, in [min, max]
     in_tokens: int  # full stream length before pruning (task + visual tokens)
     out_tokens: int  # full stream length after pruning
+
+
+def _rms_norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Parameter-free RMSNorm (computed in float32, returned in the input dtype)."""
+    dtype = x.dtype
+    x = x.to(torch.float32)
+    x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+    return x.to(dtype)
 
 
 class AdaptiveVisualTokenPruner:
@@ -84,12 +106,16 @@ class AdaptiveVisualTokenPruner:
 
     Args:
         min_keep_ratio: visual keep ratio for the most peaked importance
-            distributions seen by the calibration window.
+            distributions seen by the calibration window (the reference's
+            ``1 - (rho + tau)``).
         max_keep_ratio: visual keep ratio for the most uniform importance
-            distributions seen by the calibration window.
+            distributions seen by the calibration window (the reference's
+            ``1 - (rho - tau)``); also the warm-up keep ratio for the first
+            two steps of every episode.
         min_visual_tokens: floor on kept visual tokens per sample, so a very
-            peaked distribution can never strip the visual stream bare.
-        window_size: number of recent steps used to calibrate the
+            peaked distribution can never strip the visual stream bare (the
+            reference's ``max(1, k)``).
+        window_size: number of previous steps used to calibrate the
             uniformity-to-ratio mapping.
         apply_during_training: also prune on the training forward pass. FastVLA
             prunes at inference only, and the sliding-window calibration assumes
@@ -98,10 +124,10 @@ class AdaptiveVisualTokenPruner:
 
     def __init__(
         self,
-        min_keep_ratio: float = 0.25,
-        max_keep_ratio: float = 0.75,
-        min_visual_tokens: int = 16,
-        window_size: int = 8,
+        min_keep_ratio: float = 0.1,
+        max_keep_ratio: float = 0.3,
+        min_visual_tokens: int = 1,
+        window_size: int = 10,
         apply_during_training: bool = False,
     ):
         if not 0.0 < min_keep_ratio <= max_keep_ratio <= 1.0:
@@ -111,8 +137,8 @@ class AdaptiveVisualTokenPruner:
             )
         if min_visual_tokens < 1:
             raise ValueError(f"min_visual_tokens must be >= 1, got {min_visual_tokens}")
-        if window_size < 2:
-            raise ValueError(f"window_size must be >= 2, got {window_size}")
+        if window_size < 1:
+            raise ValueError(f"window_size must be >= 1, got {window_size}")
 
         self.min_keep_ratio = min_keep_ratio
         self.max_keep_ratio = max_keep_ratio
@@ -120,6 +146,7 @@ class AdaptiveVisualTokenPruner:
         self.apply_during_training = apply_during_training
         self.last_stats: PruningStats | None = None
         self._window: deque[float] = deque(maxlen=window_size)
+        self._step = 0
 
     def __repr__(self) -> str:
         return (
@@ -130,8 +157,10 @@ class AdaptiveVisualTokenPruner:
         )
 
     def reset(self) -> None:
-        """Clear the sliding-window calibration state (e.g. between episodes)."""
+        """Start a new episode: clear the calibration window, the step counter
+        (so the warm-up rule applies again) and the last stats."""
         self._window.clear()
+        self._step = 0
         self.last_stats = None
 
     def __call__(self, backbone_output: BatchFeature) -> BatchFeature:
@@ -155,12 +184,15 @@ class AdaptiveVisualTokenPruner:
             return backbone_output
 
         importance = self._task_to_vision_attention(features, task_mask, visual_mask)
-        keep_count, uniformity, keep_ratio = self._budget(num_visual, importance)
+        # Non-visual positions carry no attention mass and must never enter the
+        # top-K set that the uniformity is computed over.
+        scores = importance.masked_fill(~visual_mask, float("-inf"))
+        keep_count, uniformity, keep_ratio = self._budget(num_visual, scores)
 
         # Rank positions by importance (visual tokens first, -inf elsewhere) and
         # keep each sample's top ``keep_count`` visual tokens. Two stable
         # argsorts give exact ranks, with deterministic tie-breaking by position.
-        order = importance.argsort(dim=1, descending=True, stable=True)
+        order = scores.argsort(dim=1, descending=True, stable=True)
         rank = order.argsort(dim=1, stable=True)
         keep_visual = (rank < keep_count.unsqueeze(1)) & visual_mask
 
@@ -184,41 +216,64 @@ class AdaptiveVisualTokenPruner:
     ) -> torch.Tensor:
         """Importance of each position: attention received from task tokens.
 
-        Parameter-free single-head attention with a shared (identity) query/key
-        projection over the backbone features: for every task token, softmax
-        over visual tokens of the scaled dot product, then sum over task tokens.
-        Returns ``[B, S]`` with non-negative scores supported on visual
-        positions (FastVLA reads the equivalent quantity from the LLM's
-        attention maps; see the module docstring for the substitution).
+        FastVLA's parameter-free single-head attention over RMSNorm-normalized
+        token embeddings: for every task token, softmax over visual tokens of
+        the scaled dot product, averaged over task tokens. Zero-vector task
+        rows are skipped (they carry no direction); if every task row is zero,
+        fall back to the plain mask, as the reference does. Returns ``[B, S]``
+        with non-negative scores supported on visual positions.
         """
-        feats = features.detach().to(torch.float32)
+        raw = features.detach().to(torch.float32)
+        feats = _rms_norm(raw)
         scale = math.sqrt(feats.shape[-1])
         logits = torch.bmm(feats, feats.transpose(1, 2)) / scale
         logits = logits.masked_fill(~visual_mask[:, None, :], float("-inf"))
         task_to_vision = torch.softmax(logits, dim=-1)
-        task_to_vision = task_to_vision * task_mask[:, :, None].to(feats.dtype)
-        return task_to_vision.sum(dim=1)
+        weights = (task_mask & (raw.norm(dim=-1) > 1e-6)).to(feats.dtype)
+        weights = torch.where(
+            weights.sum(dim=1, keepdim=True) > 0, weights, task_mask.to(feats.dtype)
+        )
+        weighted_sum = (task_to_vision * weights[:, :, None]).sum(dim=1)
+        return weighted_sum / weights.sum(dim=1, keepdim=True).clamp_min(1e-12)
 
     def _budget(
-        self, num_visual: torch.Tensor, importance: torch.Tensor
+        self, num_visual: torch.Tensor, scores: torch.Tensor
     ) -> tuple[torch.Tensor, float, float]:
         """Per-sample number of visual tokens to keep, from importance uniformity."""
-        probs = importance / importance.sum(dim=1, keepdim=True).clamp_min(1e-12)
-        simpson = (probs * probs).sum(dim=1)
-        # Inverse-Simpson "effective token count" in [1, num_visual], normalized
-        # to (0, 1] so the metric is comparable across visual token counts.
-        uniformity = (1.0 / simpson.clamp_min(1e-12)) / num_visual.clamp_min(1)
-        uniformity = float(uniformity.mean())
+        num_visual_f = num_visual.to(torch.float32)
+        # FastVLA's uniformity: the normalized inverse-Simpson effective token
+        # count of the top-K importance scores, with K = ceil(N * min_keep_ratio
+        # - 1e-9) the smallest budget the keep band can request. A peaked
+        # keep-set yields U << 1, a uniform one U ~ 1. The whole batch is driven
+        # by the batch-mean U (one shared keep ratio, per-sample counts), since
+        # the reference only ever processes a single stream (batch size 1).
+        k_eff = torch.ceil(num_visual_f * self.min_keep_ratio - 1e-9).clamp_min(1).to(torch.int64)
+        sorted_scores, _ = scores.sort(dim=1, descending=True)
+        prefix = torch.arange(scores.shape[1], device=scores.device)[None, :] < k_eff[:, None]
+        top = torch.where(prefix, sorted_scores, torch.zeros_like(sorted_scores))
+        q = top / top.sum(dim=1, keepdim=True).clamp_min(1e-12)
+        simpson = (q * q).sum(dim=1)
+        u_per_sample = (1.0 / simpson.clamp_min(1e-12)) / k_eff.to(torch.float32)
+        uniformity = float(u_per_sample.mean())
 
-        # Calibrate against recent steps: a step flatter than the recent window
-        # keeps more visual tokens, a more peaked one keeps fewer. Without
-        # contrast (first step, static scene) use the midpoint budget.
+        # Calibrate against the previous steps: a step flatter than the recent
+        # window keeps more visual tokens, a more peaked one keeps fewer. The
+        # first two steps of an episode run at the maximum-keep end of the band
+        # (the reference's rate = rho - tau warm-up); a window with no contrast
+        # falls back to the band midpoint (the reference's rate = rho).
+        if self._step < 2:
+            alpha = 1.0
+        else:
+            lo, hi = min(self._window), max(self._window)
+            if hi - lo < 1e-12:
+                alpha = 0.5
+            else:
+                alpha = min(1.0, max(0.0, (uniformity - lo) / (hi - lo)))
         self._window.append(uniformity)
-        lo, hi = min(self._window), max(self._window)
-        alpha = 0.5 if hi - lo < 1e-6 else (uniformity - lo) / (hi - lo)
-        keep_ratio = self.min_keep_ratio + alpha * (self.max_keep_ratio - self.min_keep_ratio)
+        self._step += 1
 
-        keep_count = torch.ceil(keep_ratio * num_visual.to(torch.float32)).to(torch.int64)
+        keep_ratio = self.min_keep_ratio + alpha * (self.max_keep_ratio - self.min_keep_ratio)
+        keep_count = torch.round(keep_ratio * num_visual_f).to(torch.int64)
         keep_count = keep_count.clamp(min=self.min_visual_tokens)
         keep_count = torch.minimum(keep_count, num_visual)
         return keep_count, uniformity, keep_ratio

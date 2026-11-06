@@ -31,12 +31,13 @@ import torch
 from transformers.feature_extraction_utils import BatchFeature
 
 
-# 4 task tokens + 12 visual tokens; on a fresh pruner the sliding window has no
-# contrast, so the midpoint keep ratio 0.5 applies: ceil(0.5 * 12) = 6 visual
-# tokens kept -> 4 + 6 = 10 total.
+# 4 task tokens + 12 visual tokens; the first two steps of an episode are
+# FastVLA's warm-up (rate = rho - tau, the maximum-keep end of the band), so a
+# fresh pruner keeps at max_keep_ratio 0.75: round(0.75 * 12) = 9 visual
+# tokens kept -> 4 + 9 = 13 total.
 NUM_TASK_TOKENS = 4
 SEQ_LEN = 16
-EXPECTED_PRUNED_LEN = 10
+EXPECTED_PRUNED_LEN = 13
 
 _PRUNER_CFG = {
     "min_keep_ratio": 0.25,
@@ -130,7 +131,7 @@ class TestPruningWiredIntoActionHead:
         stats = head.visual_token_pruner.last_stats
         assert stats is not None
         assert stats.in_tokens == SEQ_LEN
-        assert stats.keep_ratio == pytest.approx(0.5)
+        assert stats.keep_ratio == pytest.approx(0.75)  # warm-up step: max keep
         assert stats.out_tokens == EXPECTED_PRUNED_LEN
 
         # The returned features and the in-place rewritten masks agree on the
@@ -235,22 +236,57 @@ class TestAdaptiveBudget:
             min_keep_ratio=0.2, max_keep_ratio=0.8, min_visual_tokens=1, window_size=4
         )
 
+        # The first two steps are warm-up (max keep) whatever the distribution.
         pruner(_distribution_stream("peaked"))
-        first_stats = pruner.last_stats
-        assert first_stats.keep_ratio == pytest.approx(0.5)  # no window contrast yet
+        warmup_stats = pruner.last_stats
+        assert warmup_stats.keep_ratio == pytest.approx(0.8)
 
         pruner(_distribution_stream("uniform"))
-        uniform_stats = pruner.last_stats
+        assert pruner.last_stats.keep_ratio == pytest.approx(0.8)  # still warm-up
+
+        # From step 2 the window calibrates: uniform importance is scored more
+        # uniform than peaked importance, and the budget follows: max for the
+        # flattest step in the window, min for the most peaked one.
         pruner(_distribution_stream("peaked"))
         peaked_stats = pruner.last_stats
+        pruner(_distribution_stream("uniform"))
+        uniform_stats = pruner.last_stats
 
-        # Uniform importance is scored more uniform than peaked importance, and
-        # the calibrated budget follows: max for the flattest step in the
-        # window, min for the most peaked one.
         assert uniform_stats.uniformity > peaked_stats.uniformity
-        assert uniform_stats.keep_ratio == pytest.approx(0.8)
         assert peaked_stats.keep_ratio == pytest.approx(0.2)
-        assert uniform_stats.keep_ratio > first_stats.keep_ratio > peaked_stats.keep_ratio
+        assert uniform_stats.keep_ratio == pytest.approx(0.8)
+        assert peaked_stats.keep_ratio < warmup_stats.keep_ratio
+
+    def test_warmup_uses_max_keep_for_first_two_steps(self):
+        # FastVLA's warm-up: while the calibration window is unpopulated, the
+        # first two steps of every episode run at rate = rho - tau, the
+        # maximum-keep end of the band (reference test: kept[0] == kept[1] == hi).
+        pruner = AdaptiveVisualTokenPruner(
+            min_keep_ratio=0.2, max_keep_ratio=0.8, min_visual_tokens=1, window_size=4
+        )
+        torch.manual_seed(0)
+        for _ in range(2):
+            pruner(_make_stream(torch.randn(1, 9, 4), [False] + [True] * 8))
+            assert pruner.last_stats.keep_ratio == pytest.approx(0.8)
+
+        # Step 2 calibrates against the window of the two warm-up steps.
+        pruner(_make_stream(torch.randn(1, 9, 4), [False] + [True] * 8))
+        assert 0.2 <= pruner.last_stats.keep_ratio <= 0.8
+
+    def test_uniformity_is_computed_over_keep_set(self):
+        # FastVLA's uniformity is the normalized inverse-Simpson index of the
+        # top-K importance scores (K = smallest budget the band can request),
+        # not of all N scores: importance uniform over the eventual keep-set
+        # with a near-zero tail must yield U ~ 1, not U ~ min_keep_ratio.
+        pruner = AdaptiveVisualTokenPruner(min_keep_ratio=0.25, max_keep_ratio=0.75)
+        scores = torch.tensor([[9.0, 6.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]])
+
+        _, uniformity, _ = pruner._budget(torch.tensor([8]), scores)
+
+        # K = ceil(8 * 0.25 - 1e-9) = 2; q = [0.6, 0.4] over the keep set.
+        assert uniformity == pytest.approx((1.0 / (0.6**2 + 0.4**2)) / 2)
+        all_token = (1.0 / ((9 / 21) ** 2 + (6 / 21) ** 2 + 6 * (1 / 21) ** 2)) / 8
+        assert uniformity > all_token + 0.4  # all-token metric would be ~0.45
 
     def test_keep_count_respects_bounds(self):
         pruner = AdaptiveVisualTokenPruner(
@@ -273,13 +309,15 @@ class TestAdaptiveBudget:
             min_keep_ratio=0.2, max_keep_ratio=0.8, min_visual_tokens=1, window_size=4
         )
         pruner(_distribution_stream("uniform"))
+        pruner(_distribution_stream("peaked"))
         assert pruner.last_stats is not None
 
         pruner.reset()
         assert pruner.last_stats is None
         pruner(_distribution_stream("uniform"))
-        # Window is empty again -> midpoint budget.
-        assert pruner.last_stats.keep_ratio == pytest.approx(0.5)
+        # Window is empty and the step counter restarts, so the warm-up
+        # (max-keep) rule applies again — reset makes episodes deterministic.
+        assert pruner.last_stats.keep_ratio == pytest.approx(0.8)
 
 
 class TestSelectionAndCompaction:
@@ -295,11 +333,24 @@ class TestSelectionAndCompaction:
         )
         pruner(stream)
 
-        # First call -> midpoint ratio 0.5 -> ceil(0.5 * 4) = 2 visual kept.
-        assert stream["backbone_features"].shape[1] == 4
+        # Warm-up step -> max ratio 0.75 -> round(0.75 * 4) = 3 visual kept.
+        assert stream["backbone_features"].shape[1] == 5
         assert torch.equal(stream["backbone_features"][0, :2], features[0, :2])
-        assert stream["image_mask"][0].tolist() == [False, False, True, True]
+        assert stream["image_mask"][0].tolist() == [False, False, True, True, True]
         assert stream["backbone_attention_mask"].all()
+
+    def test_keep_count_uses_round_not_ceil(self):
+        # FastVLA keeps round((1 - rate) * N) tokens; for N = 8 and warm-up
+        # ratio 0.3 that is round(2.4) = 2, where a ceil would keep 3.
+        torch.manual_seed(0)
+        stream = _make_stream(torch.randn(1, 9, 4), [False] + [True] * 8)
+
+        pruner = AdaptiveVisualTokenPruner(
+            min_keep_ratio=0.2, max_keep_ratio=0.3, min_visual_tokens=1, window_size=4
+        )
+        pruner(stream)
+
+        assert stream["backbone_features"].shape[1] == 3  # 1 task + 2 visual
 
     def test_highest_importance_visual_token_survives(self):
         stream = _distribution_stream("peaked")
@@ -351,7 +402,6 @@ class TestConfigValidation:
             {"min_keep_ratio": 0.8, "max_keep_ratio": 0.2},
             {"min_keep_ratio": 0.0, "max_keep_ratio": 0.5},
             {"min_visual_tokens": 0},
-            {"window_size": 1},
         ],
     )
     def test_invalid_config_raises(self, kwargs):
@@ -359,3 +409,59 @@ class TestConfigValidation:
         defaults.update(kwargs)
         with pytest.raises(ValueError):
             AdaptiveVisualTokenPruner(**defaults)
+
+    def test_window_size_one_is_allowed(self):
+        # The reference allows window >= 1 (a 1-step window degenerates to the
+        # midpoint budget after warm-up); only < 1 is invalid.
+        AdaptiveVisualTokenPruner(window_size=1)
+        with pytest.raises(ValueError):
+            AdaptiveVisualTokenPruner(window_size=0)
+
+
+class TestImportanceScoring:
+    """FastVLA's parameter-free task-to-vision attention over RMSNorm'd features."""
+
+    def test_importance_uses_direction_not_raw_norm(self):
+        # Two near-aligned visual tokens: a tiny-norm but better-aligned one
+        # and a large-norm but less-aligned one. RMSNorm makes the score track
+        # direction, so the aligned token wins despite its 30x smaller norm;
+        # raw dot products would let the large norm dominate instead.
+        features = torch.tensor(
+            [[[1.0, 0.0, 0.0, 0.0], [0.1, 0.1, 0.0, 0.0], [3.0, 4.0, 0.0, 0.0]]]
+        )
+        stream = _make_stream(features, [False, True, True])
+
+        pruner = AdaptiveVisualTokenPruner(
+            min_keep_ratio=0.2, max_keep_ratio=0.3, min_visual_tokens=1, window_size=4
+        )
+        pruner(stream)
+
+        # Warm-up ratio 0.3 -> round(0.3 * 2) = 1 visual token kept: the
+        # better-aligned one, not the larger-normed one.
+        assert stream["backbone_features"].shape[1] == 2
+        assert torch.equal(stream["backbone_features"][0, 1], features[0, 1])
+
+    def test_zero_task_rows_do_not_change_importance(self):
+        # Zero-vector task rows are placeholders and must be skipped, exactly
+        # as in the reference's importance().
+        torch.manual_seed(0)
+        task, visual = torch.randn(2, 4), torch.randn(6, 4)
+        base = torch.cat([task, visual]).unsqueeze(0)
+        base_task = torch.zeros(1, 8, dtype=torch.bool)
+        base_task[0, :2] = True
+        base_visual = torch.zeros(1, 8, dtype=torch.bool)
+        base_visual[0, 2:] = True
+
+        padded = torch.cat([task, torch.zeros(2, 4), visual]).unsqueeze(0)
+        padded_task = torch.zeros(1, 10, dtype=torch.bool)
+        padded_task[0, :4] = True  # zero rows sit inside the task span
+        padded_visual = torch.zeros(1, 10, dtype=torch.bool)
+        padded_visual[0, 4:] = True
+
+        base_scores = AdaptiveVisualTokenPruner._task_to_vision_attention(
+            base, base_task, base_visual
+        )
+        padded_scores = AdaptiveVisualTokenPruner._task_to_vision_attention(
+            padded, padded_task, padded_visual
+        )
+        assert torch.allclose(base_scores[0, 2:], padded_scores[0, 4:])
